@@ -7,6 +7,30 @@ import { useAuth } from '../components/AuthProvider';
 import AuthPanel from '../components/AuthPanel';
 import PortfolioDashboard from '../components/PortfolioDashboard';
 
+const fallbackCards = [
+  {
+    name: 'Pikachu V',
+    set: 'Scarlet & Violet',
+    number: '001/198',
+    price: '$12.50',
+    description: 'Popular promo card with strong collector demand.',
+  },
+  {
+    name: 'Charizard ex',
+    set: 'Obsidian Flames',
+    number: '186/197',
+    price: '$28.00',
+    description: 'Fast-moving high-value staple for modern decks.',
+  },
+  {
+    name: 'Umbreon VMAX',
+    set: 'Evolving Skies',
+    number: '054/203',
+    price: '$18.75',
+    description: 'A classic collector favorite with steady interest.',
+  },
+];
+
 function toBase64(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -24,6 +48,10 @@ export default function HomePage() {
   const [isScanning, setIsScanning] = useState(false);
   const [scanMessage, setScanMessage] = useState('');
   const [scanError, setScanError] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState([]);
+  const [searchMessage, setSearchMessage] = useState('');
+  const [searchLoading, setSearchLoading] = useState(false);
 
   useEffect(() => {
     if (!user) {
@@ -99,6 +127,45 @@ export default function HomePage() {
     return cards.reduce((sum, card) => sum + Number(card.estimatedValue || 0), 0);
   }, [cards]);
 
+  const handleSearch = async (event) => {
+    event.preventDefault();
+    const query = searchQuery.trim();
+    if (!query) {
+      setSearchResults([]);
+      setSearchMessage('Enter a card name to search.');
+      return;
+    }
+
+    setSearchLoading(true);
+    setSearchMessage('Searching for market matches…');
+
+    try {
+      const response = await fetch(`https://api.pokewallet.io/search?q=${encodeURIComponent(query)}`, {
+        headers: { Accept: 'application/json' },
+      });
+
+      if (!response.ok) throw new Error('Search unavailable');
+
+      const data = await response.json();
+      const items = Array.isArray(data) ? data : data.cards || [];
+      const mapped = items.slice(0, 6).map((item) => ({
+        name: item.name || item.cardName || query,
+        set: item.setName || 'Unknown set',
+        number: item.cardNumber || item.number || '—',
+        price: item.marketValue || item.price || '$0.00',
+        description: item.description || 'Market data returned from PokeWallet.',
+      }));
+
+      setSearchResults(mapped.length ? mapped : fallbackCards.slice(0, 3));
+      setSearchMessage(mapped.length ? 'Live card matches found.' : 'No live matches were returned, so sample cards are shown.');
+    } catch (error) {
+      setSearchResults(fallbackCards.slice(0, 3));
+      setSearchMessage('Live pricing is unavailable right now. Showing popular sample cards instead.');
+    } finally {
+      setSearchLoading(false);
+    }
+  };
+
   return (
     <main className="page-shell">
       <section className="hero-card">
@@ -106,7 +173,7 @@ export default function HomePage() {
           <p className="eyebrow">Free Pokémon TCG analytics</p>
           <h1>Collect It</h1>
           <p className="hero-copy">
-            Scan cards, gather pricing data, and build a live binder with a free AI-assisted workflow.
+            Scan cards, search the market, and build a smarter binder in one polished dashboard.
           </p>
         </div>
         <div className="hero-actions">
@@ -118,6 +185,39 @@ export default function HomePage() {
             onLogin={login}
             onLogout={logout}
           />
+        </div>
+      </section>
+
+      <section className="search-card">
+        <div className="search-header">
+          <p className="eyebrow">Search cards</p>
+          <h2>Find cards like a collector pro</h2>
+          <p>Search by card name and number, then jump straight to live deal links.</p>
+        </div>
+        <form className="search-form" onSubmit={handleSearch}>
+          <input
+            value={searchQuery}
+            onChange={(event) => setSearchQuery(event.target.value)}
+            placeholder="Try Pikachu, Charizard, Umbreon..."
+          />
+          <button type="submit" disabled={searchLoading}>{searchLoading ? 'Searching…' : 'Search'}</button>
+        </form>
+        {searchMessage ? <p className="muted-text">{searchMessage}</p> : null}
+        <div className="result-grid">
+          {searchResults.map((item) => {
+            const dealUrl = `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(item.name)}+${encodeURIComponent(item.number)}&LH_BIN=1&sop=15`;
+            return (
+              <article className="result-item" key={`${item.name}-${item.number}`}>
+                <div className="result-topline">
+                  <strong>{item.name}</strong>
+                  <span>{item.price}</span>
+                </div>
+                <p>{item.set} • {item.number}</p>
+                <p className="result-description">{item.description}</p>
+                <a href={dealUrl} target="_blank" rel="noreferrer">View eBay deal</a>
+              </article>
+            );
+          })}
         </div>
       </section>
 
