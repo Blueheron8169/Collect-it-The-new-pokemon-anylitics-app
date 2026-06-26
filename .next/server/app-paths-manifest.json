@@ -2,6 +2,6 @@
   "/_not-found/page": "app/_not-found/page.js",
   "/api/pokewallet/route": "app/api/pokewallet/route.js",
   "/api/scan/route": "app/api/scan/route.js",
-  "/api/ximilar/route": "app/api/ximilar/route.js",
-  "/page": "app/page.js"
+  "/page": "app/page.js",
+  "/api/ximilar/route": "app/api/ximilar/route.js"
 }
