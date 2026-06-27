@@ -31,17 +31,24 @@ export default function AuthPanel({ user, loading, onGoogleSignIn, onRegister, o
   if (!user) {
     return (
       <div className="auth-card">
-        <h3>Sign in</h3>
-        <p>Use Google or email to unlock your binder.</p>
+        <h3>{mode === 'register' ? 'Create a free account' : 'Sign in'}</h3>
+        <p className="muted-text" style={{ marginTop: 0, fontSize: '0.9rem' }}>
+          {mode === 'register'
+            ? 'Email and password signup takes less than a minute.'
+            : 'Sign in to sync your binder across devices.'}
+        </p>
         <form onSubmit={submit}>
-          <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email" type="email" />
-          <input value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" type="password" />
+          <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email" type="email" required />
+          <input value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" type="password" minLength={6} required />
           <button type="submit">{mode === 'register' ? 'Create account' : 'Log in'}</button>
         </form>
-        <button className="secondary-btn" onClick={() => setMode(mode === 'login' ? 'register' : 'login')}>
-          {mode === 'login' ? 'Need an account?' : 'Back to login'}
+        <button className="secondary-btn" type="button" onClick={() => setMode(mode === 'login' ? 'register' : 'login')}>
+          {mode === 'login' ? 'Need an account? Sign up free' : 'Already have an account? Log in'}
         </button>
-        <button className="secondary-btn" onClick={onGoogleSignIn}>Continue with Google</button>
+        <button className="secondary-btn" type="button" onClick={onGoogleSignIn}>Continue with Google</button>
+        <p className="muted-text" style={{ fontSize: '0.82rem', marginBottom: 0 }}>
+          No account needed. Cards save to this device automatically.
+        </p>
         {message ? <p className="success-text">{message}</p> : null}
         {error ? <p className="error-text">{error}</p> : null}
       </div>
@@ -51,8 +58,8 @@ export default function AuthPanel({ user, loading, onGoogleSignIn, onRegister, o
   return (
     <div className="auth-card">
       <h3>Signed in</h3>
-      <p>{user.email || user.displayName}</p>
-      <button onClick={onLogout}>Sign out</button>
+      <p className="muted-text" style={{ marginTop: 0 }}>{user.email || user.displayName}</p>
+      <button type="button" onClick={onLogout}>Sign out</button>
     </div>
   );
 }
