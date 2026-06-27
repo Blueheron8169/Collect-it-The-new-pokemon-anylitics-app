@@ -5,11 +5,10 @@ import { addDoc, collection, deleteDoc, doc, onSnapshot, serverTimestamp } from 
 import { db } from '../lib/firebase';
 import { useAuth } from '../components/AuthProvider';
 import AuthPanel from '../components/AuthPanel';
-import BrandLogo from '../components/BrandLogo';
 import PortfolioDashboard from '../components/PortfolioDashboard';
+import BrandLogo from '../components/BrandLogo';
 import CameraCapture from '../components/CameraCapture';
 import { buildFallbackCard, buildSearchResults, formatCurrency } from '../lib/cardUtils';
-import { buildEbaySearchUrl } from '../lib/affiliateLinks';
 
 function getDateValue(raw) {
   if (!raw) return 0;
@@ -38,7 +37,15 @@ function readLocalBinder() {
 
     const parsed = JSON.parse(localCards);
     return Array.isArray(parsed) ? parsed : [];
-  } catch {
+  } catch (error) {
+    console.error('Local binder hydration failed:', error);
+
+    try {
+      window.localStorage.removeItem('collect-it-local-binder');
+    } catch {
+      // Ignore preview environments that block storage writes.
+    }
+
     return [];
   }
 }
@@ -48,25 +55,9 @@ function writeLocalBinder(cards) {
 
   try {
     window.localStorage.setItem('collect-it-local-binder', JSON.stringify(cards));
-  } catch {
-    // Ignore storage write failures in restricted environments.
+  } catch (error) {
+    console.error('Local binder persistence failed:', error);
   }
-}
-
-function pickBestCardMatch(results, preferredNumber = '') {
-  if (!Array.isArray(results) || !results.length) return null;
-  const normalizedNumber = String(preferredNumber || '').trim().toLowerCase();
-  if (!normalizedNumber) {
-    return results.find((item) => Number(item.priceValue || 0) > 0) || results[0];
-  }
-
-  const exactNumberMatch = results.find((item) => String(item.number || '').toLowerCase() === normalizedNumber);
-  if (exactNumberMatch) return exactNumberMatch;
-
-  const looseMatch = results.find((item) => String(item.number || '').toLowerCase().includes(normalizedNumber));
-  if (looseMatch) return looseMatch;
-
-  return results.find((item) => Number(item.priceValue || 0) > 0) || results[0];
 }
 
 async function optimizeImageForScan(file) {
@@ -118,21 +109,24 @@ export default function HomePage() {
   const [manualPrice, setManualPrice] = useState('');
   const [manualQuantity, setManualQuantity] = useState('1');
   const [manualCost, setManualCost] = useState('');
+  const [showManualOverrides, setShowManualOverrides] = useState(false);
   const [activeTab, setActiveTab] = useState('discover');
   const [showCamera, setShowCamera] = useState(false);
   const [identifyQuery, setIdentifyQuery] = useState('');
   const [identifyResults, setIdentifyResults] = useState([]);
   const [identifyLoading, setIdentifyLoading] = useState(false);
 
+  // Mirror cards in a ref so auth-transition effects can always read the latest value
+  // even if the state update hasn't flushed yet.
   const cardsRef = useRef([]);
-  useEffect(() => {
-    cardsRef.current = cards;
-  }, [cards]);
+  useEffect(() => { cardsRef.current = cards; }, [cards]);
 
   useEffect(() => {
     if (loading) return;
 
     if (!user) {
+      // On logout: save whatever cards are in memory (cloud cards) to localStorage
+      // so the user's portfolio is not wiped when they sign out.
       const current = cardsRef.current;
       if (current.length > 0) writeLocalBinder(current);
 
@@ -142,36 +136,37 @@ export default function HomePage() {
       return;
     }
 
+    // On login: cloud Firestore is the source of truth. Clear local storage so
+    // guest cards from a different session don't pollute the cloud binder.
     writeLocalBinder([]);
 
     const unsubscribe = onSnapshot(
       collection(db, 'users', user.uid, 'binder'),
       (snapshot) => {
         const nextCards = snapshot.docs
-          .map((entry) => normalizeCard({ id: entry.id, ...entry.data() }))
+          .map((doc) => normalizeCard({ id: doc.id, ...doc.data() }))
           .sort((a, b) => getDateValue(b.createdAt) - getDateValue(a.createdAt));
         setCards(nextCards);
       },
-      () => {
-        setScanError('Could not load cloud binder. Your local cards are still available.');
+      (error) => {
+        console.error('Binder snapshot failed:', error);
+        setScanError('Could not load cloud binder. Your cards are still visible locally.');
       },
     );
 
     return () => unsubscribe();
   }, [user, loading]);
 
+  // Persist guest (logged-out) cards to localStorage whenever they change.
   useEffect(() => {
     if (user || loading) return;
     writeLocalBinder(cards);
   }, [cards, user, loading]);
 
+  // Live card identify: debounced search as user types in the Scan tab.
   useEffect(() => {
     const trimmed = identifyQuery.trim();
-    if (trimmed.length < 2) {
-      setIdentifyResults([]);
-      return;
-    }
-
+    if (trimmed.length < 2) { setIdentifyResults([]); return; }
     const timer = setTimeout(async () => {
       setIdentifyLoading(true);
       try {
@@ -181,13 +176,10 @@ export default function HomePage() {
           body: JSON.stringify({ q: trimmed }),
         });
         const data = await res.json();
-        setIdentifyResults(data.results || []);
-      } catch {
-        setIdentifyResults([]);
-      }
+        setIdentifyResults((data.results || []).slice(0, 6));
+      } catch { setIdentifyResults([]); }
       setIdentifyLoading(false);
     }, 380);
-
     return () => clearTimeout(timer);
   }, [identifyQuery]);
 
@@ -209,9 +201,37 @@ export default function HomePage() {
     setScanMessage('');
   };
 
+  const handleIdentifySelect = async (tcgCard) => {
+    const payload = {
+      cardName: tcgCard.name,
+      setName: tcgCard.set,
+      cardNumber: tcgCard.number,
+      estimatedValue: Number(tcgCard.priceValue || 0),
+      imageUrl: tcgCard.imageUrl,
+      estimatedCondition: 'Near Mint',
+      centeringAnalysis: 'Identified from live TCG database.',
+      edgeWear: 'Unknown',
+      source: 'identified',
+      quantity: 1,
+      purchasePrice: 0,
+      priceData: [{ label: tcgCard.set, value: Number(tcgCard.priceValue || 0) }],
+    };
+    try {
+      await addCardToCollection(payload);
+      setScanInsight(payload);
+      setScanMessage(`✔ Added ${tcgCard.name} to your binder!`);
+      setIdentifyQuery('');
+      setIdentifyResults([]);
+      setPreviewUrl('');
+      setSelectedFile(null);
+      setActiveTab('portfolio');
+    } catch (error) {
+      setScanError(error.message || 'Could not add card.');
+    }
+  };
+
   const addCardToCollection = async (payload) => {
     const normalized = normalizeCard(payload);
-
     if (user) {
       const optimisticId = `local-${Date.now()}`;
       setCards((current) => [{ ...normalized, id: optimisticId, createdAt: new Date().toISOString() }, ...current]);
@@ -230,33 +250,19 @@ export default function HomePage() {
     return null;
   };
 
-  const handleIdentifySelect = async (tcgCard) => {
-    const payload = {
-      cardName: tcgCard.name,
-      setName: tcgCard.set,
-      cardNumber: tcgCard.number,
-      estimatedValue: Number(tcgCard.priceValue || 0),
-      imageUrl: tcgCard.imageUrl,
-      estimatedCondition: 'Near Mint',
-      centeringAnalysis: 'Identified from live TCG database.',
-      edgeWear: 'Unknown',
-      source: 'identified',
-      quantity: 1,
-      purchasePrice: 0,
-      priceData: [{ label: tcgCard.set, value: Number(tcgCard.priceValue || 0) }],
-    };
+  const handleRemoveCard = async (cardId) => {
+    if (!cardId) return;
+
+    const previous = cards;
+    setCards((current) => current.filter((card) => card.id !== cardId));
 
     try {
-      await addCardToCollection(payload);
-      setScanInsight(payload);
-      setScanMessage(`Added ${tcgCard.name} to your binder.`);
-      setIdentifyQuery('');
-      setIdentifyResults([]);
-      setPreviewUrl('');
-      setSelectedFile(null);
-      setActiveTab('portfolio');
+      if (user && !String(cardId).startsWith('local-')) {
+        await deleteDoc(doc(db, 'users', user.uid, 'binder', cardId));
+      }
     } catch (error) {
-      setScanError(error.message || 'Could not add card.');
+      setCards(previous);
+      setScanError('Could not remove card. Please try again.');
     }
   };
 
@@ -268,74 +274,39 @@ export default function HomePage() {
 
     setIsScanning(true);
     setScanError('');
-    setScanMessage('Analyzing your card image...');
+    setScanMessage('Analyzing your card image…');
 
     try {
       const optimized = await optimizeImageForScan(selectedFile);
-      let scanData = {};
-      try {
-        const scanResponse = await fetch('/api/scan', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            imageBase64: optimized.base64,
-            mimeType: optimized.mimeType,
-          }),
-        });
-        scanData = await scanResponse.json();
-        if (!scanResponse.ok) {
-          throw new Error(scanData?.error || 'Card scan failed.');
-        }
-      } catch {
-        scanData = {};
-      }
+      const scanResponse = await fetch('/api/scan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          imageBase64: optimized.base64,
+          mimeType: optimized.mimeType,
+        }),
+      });
+      if (!scanResponse.ok) throw new Error('Card scan failed.');
 
-      const typedName = manualName.trim() || identifyQuery.trim();
-      const resolvedName = typedName || String(scanData.cardName || '').trim();
-      const resolvedNumber = manualNumber.trim() || String(scanData.cardNumber || '').trim();
-
-      if (!typedName && scanData?.message) {
-        setScanMessage(scanData.message);
-      }
-
-      if (!resolvedName) {
-        const aiHint = String(scanData.pokemonName || '').trim();
-        if (aiHint) {
-          setIdentifyQuery(aiHint);
-          setScanError('AI found partial details. Pick the correct card from the list below to finish adding.');
-          setScanMessage('Almost there. Confirm the card name from suggestions and scan again.');
-        } else {
-          setScanError('Could not identify this card automatically. Use the Name this card field, then scan again.');
-        }
-        return;
-      }
-
-      if (!scanData.cardName && typedName) {
-        setScanMessage('AI scan was unavailable, but your manual card name was used successfully.');
-      }
-
+      const scanData = await scanResponse.json();
       const fallbackCard = buildFallbackCard(selectedFile.name, {
-        name: resolvedName,
+        name: manualName || scanData.cardName,
         set: manualSet || scanData.setName,
-        number: resolvedNumber,
+        number: manualNumber || scanData.cardNumber,
         price: manualPrice || scanData.estimatedValue,
       });
 
       const marketResponse = await fetch('/api/pokewallet', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ q: `${fallbackCard.cardName} ${fallbackCard.cardNumber}`.trim() }),
+        body: JSON.stringify({ q: `${fallbackCard.cardName} ${fallbackCard.cardNumber}` }),
       });
       const marketData = await marketResponse.json();
-      const tcgCard = pickBestCardMatch(marketData.results, fallbackCard.cardNumber);
+      // Pick the first TCG result that has a real price — use that for value and image.
+      const tcgCard = marketData.results?.find((r) => Number(r.priceValue || 0) > 0) || marketData.results?.[0];
 
       const payload = {
-        ...buildFallbackCard(selectedFile.name, {
-          name: tcgCard?.name || fallbackCard.cardName,
-          set: tcgCard?.set || fallbackCard.setName,
-          number: tcgCard?.number || fallbackCard.cardNumber,
-          price: manualPrice || tcgCard?.priceValue || marketData.marketEstimate || fallbackCard.estimatedValue,
-        }),
+        ...fallbackCard,
         source: scanData.source || 'fallback',
         createdAt: new Date().toISOString(),
         estimatedValue: Number(tcgCard?.priceValue || marketData.marketEstimate || fallbackCard.estimatedValue || 0),
@@ -354,31 +325,11 @@ export default function HomePage() {
 
       await addCardToCollection(payload);
       setScanMessage(`Saved ${payload.cardName} to your binder.`);
-      setIdentifyQuery('');
-      setIdentifyResults([]);
-      setPreviewUrl('');
-      setSelectedFile(null);
       setActiveTab('portfolio');
     } catch (error) {
-      setScanError(error.message || 'Scan failed.');
+      setScanError(error.message || 'Card scan failed.');
     } finally {
       setIsScanning(false);
-    }
-  };
-
-  const handleRemoveCard = async (cardId) => {
-    if (!cardId) return;
-
-    const previous = cards;
-    setCards((current) => current.filter((card) => card.id !== cardId));
-
-    try {
-      if (user && !String(cardId).startsWith('local-')) {
-        await deleteDoc(doc(db, 'users', user.uid, 'binder', cardId));
-      }
-    } catch {
-      setCards(previous);
-      setScanError('Could not remove card. Please try again.');
     }
   };
 
@@ -400,7 +351,7 @@ export default function HomePage() {
     }
 
     setSearchLoading(true);
-    setSearchMessage('Checking live market listings...');
+    setSearchMessage('Checking live market listings…');
 
     try {
       const response = await fetch('/api/pokewallet', {
@@ -420,16 +371,15 @@ export default function HomePage() {
         imageUrl: card.imageUrl,
       }));
 
-      if (mapped.length) {
-        setSearchResults(mapped);
-        setSearchMessage(`Found ${mapped.length} matching cards from live Pokemon TCG data.`);
-      } else {
-        setSearchResults([]);
-        setSearchMessage('No matching cards found for that search. Try a broader name.');
-      }
-    } catch {
+      setSearchResults(mapped.length ? mapped : buildSearchResults(query));
+      setSearchMessage(
+        marketData.fallback
+          ? 'Showing dependable fallback results for that card name.'
+          : `Found ${mapped.length} matching cards from live Pokemon TCG data.`,
+      );
+    } catch (error) {
       setSearchResults(buildSearchResults(query));
-      setSearchMessage('Live pricing is temporarily unavailable. Showing starter examples instead.');
+      setSearchMessage('Pricing service is unavailable, so sample cards were shown.');
     } finally {
       setSearchLoading(false);
     }
@@ -448,7 +398,6 @@ export default function HomePage() {
       quantity: 1,
       purchasePrice: 0,
       createdAt: new Date().toISOString(),
-      imageUrl: result.imageUrl,
       priceData: [{ label: 'Live market', value: Number(result.priceValue || result.price || 0) }],
     };
 
@@ -463,20 +412,9 @@ export default function HomePage() {
 
   return (
     <main className="page-shell">
-      <header className="top-nav-shell">
-        <div className="top-nav-brand">
-          <BrandLogo />
-        </div>
-        <div className="tab-row" role="tablist" aria-label="Main sections">
-          <button type="button" className={`tab-btn ${activeTab === 'discover' ? 'active' : ''}`} onClick={() => setActiveTab('discover')}>Discover</button>
-          <button type="button" className={`tab-btn ${activeTab === 'scan' ? 'active' : ''}`} onClick={() => setActiveTab('scan')}>Scan</button>
-          <button type="button" className={`tab-btn ${activeTab === 'portfolio' ? 'active' : ''}`} onClick={() => setActiveTab('portfolio')}>Portfolio</button>
-        </div>
-        <div className="top-nav-kpi">Tracked cards: <strong>{cards.length}</strong></div>
-      </header>
-
       <section className="hero-card">
         <div>
+          <BrandLogo />
           <p className="eyebrow">Pokemon-focused collectr style tracking</p>
           <h1>Track your binder like a serious vault</h1>
           <p className="hero-copy">
@@ -509,6 +447,12 @@ export default function HomePage() {
         </div>
       </section>
 
+      <div className="tab-row" role="tablist" aria-label="Main sections">
+        <button type="button" className={`tab-btn ${activeTab === 'discover' ? 'active' : ''}`} onClick={() => setActiveTab('discover')}>Discover</button>
+        <button type="button" className={`tab-btn ${activeTab === 'scan' ? 'active' : ''}`} onClick={() => setActiveTab('scan')}>Scan</button>
+        <button type="button" className={`tab-btn ${activeTab === 'portfolio' ? 'active' : ''}`} onClick={() => setActiveTab('portfolio')}>Portfolio</button>
+      </div>
+
       {activeTab === 'discover' ? (
         <section className="panel-card">
           <div className="panel-heading">
@@ -524,12 +468,12 @@ export default function HomePage() {
               onChange={(event) => setSearchQuery(event.target.value)}
               placeholder="Try Pikachu, Charizard, Umbreon..."
             />
-            <button type="submit" disabled={searchLoading}>{searchLoading ? 'Searching...' : 'Search'}</button>
+            <button type="submit" disabled={searchLoading}>{searchLoading ? 'Searching…' : 'Search'}</button>
           </form>
           {searchMessage ? <p className="muted-text">{searchMessage}</p> : null}
           <div className="result-grid">
             {searchResults.map((item) => {
-              const dealUrl = buildEbaySearchUrl(item.name, item.number);
+              const dealUrl = `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(item.name)}+${encodeURIComponent(item.number)}&LH_BIN=1&sop=15`;
               return (
                 <article className="result-item" key={`${item.name}-${item.number}`}>
                   {item.imageUrl ? <img src={item.imageUrl} alt={item.name} className="card-image" /> : null}
@@ -556,33 +500,22 @@ export default function HomePage() {
         <section className="panel-card">
           <p className="eyebrow">Scan &amp; add</p>
           <h2 style={{ margin: '0 0 6px' }}>Add a card to your binder</h2>
-          <p className="panel-copy">Take a photo or upload one, then type the card name to instantly find it with a live price.</p>
-          <div className="scan-tips">
-            <strong>Scan tips for better reads</strong>
-            <p>Keep the card fully inside frame, align edges straight, and avoid sleeve glare. Use good light and fill at least 70% of the frame.</p>
-          </div>
+          <p className="panel-copy">Take a photo or upload one, then type the card name to instantly find it in the live TCG database with the real price.</p>
 
           <div className="scan-photo-row">
             <div className="scan-preview-box">
               {previewUrl
-                ? (
-                  <>
-                    <img src={previewUrl} alt="Card preview" className="scan-preview-img" />
-                    <div className="scan-preview-guide" aria-hidden="true">
-                      <span>Center card in frame</span>
-                    </div>
-                  </>
-                )
+                ? <img src={previewUrl} alt="Card preview" className="scan-preview-img" />
                 : <div className="scan-preview-empty"><span style={{ fontSize: '2rem' }}>📷</span><span>Photo preview</span></div>
               }
             </div>
             <div className="scan-upload-col">
               <label className="upload-button">
-                <span>Choose photo</span>
+                <span>📁 Choose photo</span>
                 <input type="file" accept="image/*" onChange={handleFileChange} />
               </label>
               <button type="button" className="upload-button camera-btn" onClick={() => setShowCamera(true)}>
-                Use camera
+                📷 Use camera
               </button>
               {previewUrl ? (
                 <button type="button" className="secondary-cta" onClick={() => { setPreviewUrl(''); setSelectedFile(null); }}>Clear</button>
@@ -601,10 +534,10 @@ export default function HomePage() {
                 className="identify-input"
                 value={identifyQuery}
                 onChange={(e) => setIdentifyQuery(e.target.value)}
-                placeholder="e.g. Charizard ex, Pikachu V, Umbreon VMAX..."
+                placeholder="e.g. Charizard ex, Pikachu V, Umbreon VMAX…"
                 autoComplete="off"
               />
-              {identifyLoading ? <span className="identify-spinner">Searching...</span> : null}
+              {identifyLoading ? <span className="identify-spinner">Searching…</span> : null}
             </div>
             {identifyResults.length > 0 ? (
               <div className="identify-list">
@@ -628,15 +561,8 @@ export default function HomePage() {
             ) : null}
           </div>
 
-          <div className="scan-actions">
-            <button className="primary-btn" onClick={handleScan} disabled={isScanning || !selectedFile}>
-              {isScanning ? 'Scanning...' : 'Scan image & add card'}
-            </button>
-            {!selectedFile ? <p className="muted-text">Add a photo first, then scan.</p> : null}
-          </div>
-
           <details className="advanced-scan">
-            <summary>Advanced: manual values</summary>
+            <summary>Advanced: AI image scan (requires GEMINI_API_KEY in .env)</summary>
             <div className="manual-grid" style={{ marginTop: 12 }}>
               <input value={manualName} onChange={(e) => setManualName(e.target.value)} placeholder="Card name override" />
               <input value={manualSet} onChange={(e) => setManualSet(e.target.value)} placeholder="Set override" />
@@ -645,9 +571,11 @@ export default function HomePage() {
               <input value={manualQuantity} onChange={(e) => setManualQuantity(e.target.value)} placeholder="Quantity" />
               <input value={manualCost} onChange={(e) => setManualCost(e.target.value)} placeholder="Your cost" />
             </div>
+            <button className="primary-btn" onClick={handleScan} disabled={isScanning} style={{ marginTop: 12 }}>
+              {isScanning ? 'Scanning…' : 'AI scan & add'}
+            </button>
           </details>
 
-          {scanInsight?.imageUrl ? <img src={scanInsight.imageUrl} alt={scanInsight.cardName || 'Card'} className="insight-card-img" /> : null}
           {scanMessage ? <p className="success-text" style={{ marginTop: 14 }}>{scanMessage}</p> : null}
           {scanError ? <p className="error-text" style={{ marginTop: 14 }}>{scanError}</p> : null}
         </section>
@@ -660,7 +588,6 @@ export default function HomePage() {
             totalNetWorth={totalNetWorth}
             totalCostBasis={totalCostBasis}
             onRemoveCard={handleRemoveCard}
-            getDealUrl={buildEbaySearchUrl}
           />
         </section>
       ) : null}
